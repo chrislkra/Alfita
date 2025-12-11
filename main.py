@@ -17,6 +17,7 @@ from ta.trend import MACD, EMAIndicator
 from binance.client import Client
 from binance.enums import *
 from dotenv import load_dotenv
+from prompts import get_system_prompt, get_mode_config
 
 load_dotenv()
 
@@ -30,15 +31,18 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Configuración del bot
+# ============== MONK MODE CONFIG ==============
+# DeepSeek logró +24.7% con esta configuración
 TRADING_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
-LOOP_INTERVAL = 180  # 3 minutos entre decisiones
-MAX_LEVERAGE = 20
-DEFAULT_LEVERAGE = 10
-CASH_BUFFER_PERCENT = 0.30  # 30% en reserva
-MAX_POSITIONS = 6
+LOOP_INTERVAL = 120  # 2 minutos entre decisiones (Alpha Arena style)
+MAX_LEVERAGE = 10  # Monk Mode: max 10x
+DEFAULT_LEVERAGE = 5  # Monk Mode: preferir 5x
+CASH_BUFFER_PERCENT = 0.40  # Monk Mode: 40% en reserva
+MAX_POSITIONS = 3  # Monk Mode: máximo 3 posiciones
+MIN_CONFIDENCE = 0.80  # Monk Mode: solo trades con >80% confianza
 DAILY_LOSS_LIMIT = 0.05  # -5% pausa el trading
 INITIAL_BALANCE = 10000  # Para testnet
+TRADING_MODE = "monk_mode"  # baseline, monk_mode, max_leverage
 
 # Logging
 logging.basicConfig(
@@ -211,46 +215,13 @@ class TradingBot:
             return None
     
     def build_prompt(self, market_data: dict, account_info: dict) -> str:
-        """Construye el prompt para DeepSeek siguiendo el formato Alpha Arena"""
-        
-        # System prompt (estilo Alpha Arena)
-        system_prompt = """You are an autonomous crypto trading agent managing a portfolio on Binance Futures Testnet.
+        """Construye el prompt para DeepSeek usando el modo configurado"""
 
-STRICT RULES (MUST FOLLOW):
-1. Trade only: BTC, ETH, SOL, XRP, DOGE, BNB perpetuals (USDT pairs)
-2. Leverage: 10x-20x maximum per position
-3. Every trade MUST have Take-Profit (TP) and Stop-Loss (SL) defined
-4. Keep 30% cash as buffer - NEVER go all-in
-5. Maximum 6 open positions (one per coin)
-6. If no clear setup exists → HOLD (doing nothing is valid)
-7. Do NOT overtrade - quality over quantity
-8. Do NOT add to losing positions (no martingale)
-9. If daily loss exceeds 5% → recommend PAUSE
-
-RISK MANAGEMENT:
-- TP should be 1.5x to 3x the SL distance (positive risk/reward)
-- SL should be 1-3% from entry for most trades
-- Position size should risk max 2% of portfolio per trade
-
-OUTPUT FORMAT (respond ONLY with this JSON structure):
-{
-    "action": "OPEN_LONG" | "OPEN_SHORT" | "CLOSE" | "ADJUST" | "HOLD",
-    "symbol": "BTCUSDT",
-    "leverage": 10,
-    "size_percent": 10,
-    "entry": 50000,
-    "take_profit": 52000,
-    "stop_loss": 49000,
-    "confidence": 0.75,
-    "reasoning": "Brief explanation"
-}
-
-For HOLD action, still provide reasoning why no trade is better.
-For multiple actions, return an array of objects.
-RESPOND ONLY WITH VALID JSON, NO ADDITIONAL TEXT."""
+        # Obtener system prompt del modo actual (Monk Mode)
+        system_prompt = get_system_prompt(TRADING_MODE)
 
         # Market data section
-        market_section = "CURRENT MARKET DATA:\n"
+        market_section = "\n\nCURRENT MARKET DATA (15-min candles):\n"
         for pair, data in market_data.items():
             if data:
                 market_section += f"""
@@ -261,15 +232,15 @@ RESPOND ONLY WITH VALID JSON, NO ADDITIONAL TEXT."""
   EMA20: ${data['ema_20']:,.2f} | EMA50: ${data['ema_50']:,.2f}
   Trend: {data['trend']}
 """
-        
-        # Account section
+
+        # Account section - actualizado para Monk Mode (max 3 posiciones)
         account_section = f"""
 ACCOUNT STATUS:
   Balance: ${account_info['balance']:,.2f}
   Unrealized PnL: ${account_info['unrealized_pnl']:,.2f}
   Equity: ${account_info['equity']:,.2f}
   Available: ${account_info['available']:,.2f}
-  Open Positions: {account_info['position_count']}/6
+  Open Positions: {account_info['position_count']}/{MAX_POSITIONS}
 """
         
         # Open positions detail
@@ -356,9 +327,15 @@ ACCOUNT STATUS:
             action = decision.get('action', 'HOLD')
             symbol = decision.get('symbol', '')
             reasoning = decision.get('reasoning', 'No reason provided')
+            confidence = decision.get('confidence', 0)
 
             if action == 'HOLD':
                 logger.info(f"⏸️ HOLD - {reasoning}")
+                return True
+
+            # Monk Mode: verificar confianza mínima del 80%
+            if action in ['OPEN_LONG', 'OPEN_SHORT'] and confidence < MIN_CONFIDENCE:
+                logger.info(f"⏸️ SKIP - Confianza {confidence*100:.0f}% < {MIN_CONFIDENCE*100:.0f}% requerida. {reasoning}")
                 return True
 
             if action in ['OPEN_LONG', 'OPEN_SHORT']:

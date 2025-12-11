@@ -31,15 +31,16 @@ BINANCE_SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# ============== MONK MODE CONFIG ==============
-# DeepSeek logró +24.7% con esta configuración
+# ============== CONFIGURACIÓN ==============
+# Monk Mode: mismo config que baseline, diferencia es el prompt
 TRADING_PAIRS = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"]
+TRADING_PAIRS_SHORT = ["BTC", "ETH", "SOL", "XRP", "DOGE", "BNB"]  # Para el output de la IA
 LOOP_INTERVAL = 120  # 2 minutos entre decisiones (Alpha Arena style)
-MAX_LEVERAGE = 10  # Monk Mode: max 10x
-DEFAULT_LEVERAGE = 5  # Monk Mode: preferir 5x
-CASH_BUFFER_PERCENT = 0.40  # Monk Mode: 40% en reserva
-MAX_POSITIONS = 3  # Monk Mode: máximo 3 posiciones
-MIN_CONFIDENCE = 0.80  # Monk Mode: solo trades con >80% confianza
+MAX_LEVERAGE = 20
+DEFAULT_LEVERAGE = 10
+CASH_BUFFER_PERCENT = 0.30  # 30% en reserva
+MAX_POSITIONS = 6
+MIN_CONFIDENCE = 0.70  # Monk Mode: >0.7 confianza
 DAILY_LOSS_LIMIT = 0.05  # -5% pausa el trading
 INITIAL_BALANCE = 10000  # Para testnet
 TRADING_MODE = "monk_mode"  # baseline, monk_mode, max_leverage
@@ -321,39 +322,52 @@ ACCOUNT STATUS:
         if len(self.trade_history) > 50:
             self.trade_history = self.trade_history[-50:]
 
+    def _coin_to_symbol(self, coin: str) -> str:
+        """Convierte coin (BTC) a symbol (BTCUSDT)"""
+        coin = coin.upper()
+        if coin.endswith("USDT"):
+            return coin
+        return f"{coin}USDT"
+
     def execute_trade(self, decision: dict) -> bool:
         """Ejecuta la orden basada en la decisión de DeepSeek"""
         try:
-            action = decision.get('action', 'HOLD')
-            symbol = decision.get('symbol', '')
-            reasoning = decision.get('reasoning', 'No reason provided')
+            # Nuevo formato Alpha Arena
+            signal = decision.get('signal', 'hold')
+            coin = decision.get('coin', '')
+            symbol = self._coin_to_symbol(coin) if coin else ''
+            justification = decision.get('justification', 'No reason provided')
             confidence = decision.get('confidence', 0)
+            quantity = decision.get('quantity', 0)
+            leverage = decision.get('leverage', DEFAULT_LEVERAGE)
+            tp_price = decision.get('profit_target', 0)
+            sl_price = decision.get('stop_loss', 0)
+            invalidation = decision.get('invalidation_condition', '')
 
-            if action == 'HOLD':
-                logger.info(f"⏸️ HOLD - {reasoning}")
+            if signal == 'hold':
+                logger.info(f"⏸️ HOLD - {justification}")
                 return True
 
-            # Monk Mode: verificar confianza mínima del 80%
-            if action in ['OPEN_LONG', 'OPEN_SHORT'] and confidence < MIN_CONFIDENCE:
-                logger.info(f"⏸️ SKIP - Confianza {confidence*100:.0f}% < {MIN_CONFIDENCE*100:.0f}% requerida. {reasoning}")
+            # Verificar confianza mínima
+            if signal in ['buy_to_enter', 'sell_to_enter'] and confidence < MIN_CONFIDENCE:
+                logger.info(f"⏸️ SKIP - Confianza {confidence*100:.0f}% < {MIN_CONFIDENCE*100:.0f}% requerida. {justification}")
                 return True
 
-            if action in ['OPEN_LONG', 'OPEN_SHORT']:
-                # Calcular tamaño de posición
+            if signal in ['buy_to_enter', 'sell_to_enter']:
                 account = self.get_account_info()
-                size_percent = decision.get('size_percent', 10) / 100
-                leverage = decision.get('leverage', DEFAULT_LEVERAGE)
 
-                # Respetar cash buffer
-                max_usable = account['available'] * (1 - CASH_BUFFER_PERCENT)
-                position_value = max_usable * size_percent
+                # Usar quantity de la IA o calcular
+                if quantity <= 0:
+                    # Calcular basado en risk_usd o 10% del disponible
+                    risk_usd = decision.get('risk_usd', account['available'] * 0.10)
+                    ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker['price'])
+                    quantity = (risk_usd * leverage) / current_price
+                else:
+                    ticker = self.client.futures_symbol_ticker(symbol=symbol)
+                    current_price = float(ticker['price'])
 
-                # Obtener precio actual y calcular cantidad
-                ticker = self.client.futures_symbol_ticker(symbol=symbol)
-                current_price = float(ticker['price'])
-                quantity = (position_value * leverage) / current_price
-
-                # Redondear cantidad según el par
+                # Redondear cantidad
                 quantity = self._round_quantity(symbol, quantity)
 
                 if quantity <= 0:
@@ -361,9 +375,11 @@ ACCOUNT STATUS:
                     return False
 
                 # Determinar lado
-                side = SIDE_BUY if action == 'OPEN_LONG' else SIDE_SELL
+                side = SIDE_BUY if signal == 'buy_to_enter' else SIDE_SELL
+                action = 'OPEN_LONG' if signal == 'buy_to_enter' else 'OPEN_SHORT'
 
                 # Configurar leverage
+                leverage = min(leverage, MAX_LEVERAGE)
                 self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
 
                 # Orden de mercado
@@ -377,12 +393,9 @@ ACCOUNT STATUS:
                 logger.info(f"✅ {action} ejecutado: {symbol} x{leverage} - Cantidad: {quantity}")
 
                 # Guardar en historial
-                self._save_trade(action, symbol, reasoning, current_price, quantity)
+                self._save_trade(action, symbol, justification, current_price, quantity)
 
                 # Configurar TP/SL
-                tp_price = decision.get('take_profit')
-                sl_price = decision.get('stop_loss')
-
                 if tp_price and sl_price:
                     self._set_tp_sl(symbol, action, quantity, tp_price, sl_price)
 
@@ -392,12 +405,14 @@ ACCOUNT STATUS:
                 msg += f"📊 Size: {quantity} | Leverage: {leverage}x\n"
                 if tp_price and sl_price:
                     msg += f"🎯 TP: ${tp_price:,.2f} | SL: ${sl_price:,.2f}\n"
-                msg += f"\n💬 _{reasoning}_"
+                if invalidation:
+                    msg += f"❌ Invalidación: {invalidation}\n"
+                msg += f"\n💬 _{justification}_"
                 self._notify(msg)
 
                 return True
 
-            elif action == 'CLOSE':
+            elif signal == 'close':
                 # Cerrar posición existente
                 positions = self.client.futures_position_information(symbol=symbol)
                 for pos in positions:
@@ -418,12 +433,12 @@ ACCOUNT STATUS:
                         logger.info(f"✅ Posición cerrada: {symbol}")
 
                         # Guardar en historial
-                        self._save_trade(action, symbol, reasoning, entry_price, quantity)
+                        self._save_trade('CLOSE', symbol, justification, entry_price, quantity)
 
                         # Notificar
                         msg = f"🔴 *CLOSE*\n"
                         msg += f"📍 {symbol}\n"
-                        msg += f"\n💬 _{reasoning}_"
+                        msg += f"\n💬 _{justification}_"
                         self._notify(msg)
                         return True
 
@@ -441,7 +456,7 @@ ACCOUNT STATUS:
         """Configura Take Profit y Stop Loss"""
         try:
             # Determinar lados para TP/SL
-            if action == 'OPEN_LONG':
+            if action in ['OPEN_LONG', 'buy_to_enter']:
                 tp_side = SIDE_SELL
                 sl_side = SIDE_SELL
             else:

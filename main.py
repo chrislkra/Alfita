@@ -66,11 +66,36 @@ class TradingBot:
         logger.info("🤖 Trading Bot iniciado - Modo Alpha Arena")
         self._setup_leverage()
 
+        # Cerrar todas las posiciones existentes para empezar limpio
+        self._close_all_positions()
+
         # Usar balance actual como punto de partida
         account = self.client.futures_account()
         self.starting_balance = float(account['totalWalletBalance'])
         logger.info(f"💰 Balance inicial: ${self.starting_balance:.2f}")
-    
+
+    def _close_all_positions(self):
+        """Cierra todas las posiciones abiertas al iniciar"""
+        try:
+            positions = self.client.futures_position_information()
+            for pos in positions:
+                amt = float(pos['positionAmt'])
+                if amt != 0:
+                    symbol = pos['symbol']
+                    side = 'SELL' if amt > 0 else 'BUY'
+                    qty = abs(amt)
+                    self.client.futures_create_order(
+                        symbol=symbol,
+                        side=side,
+                        type='MARKET',
+                        quantity=qty,
+                        reduceOnly=True
+                    )
+                    logger.info(f"🧹 Cerrada posición {symbol}: {amt}")
+            logger.info("✅ Todas las posiciones cerradas - empezando limpio")
+        except Exception as e:
+            logger.warning(f"⚠️ Error cerrando posiciones: {e}")
+
     def _setup_leverage(self):
         """Configura leverage para todos los pares"""
         for pair in TRADING_PAIRS:

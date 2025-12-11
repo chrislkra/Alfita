@@ -11,7 +11,8 @@ from datetime import datetime
 from typing import Optional, Dict, List
 import requests
 import pandas as pd
-import pandas_ta as ta
+from ta.momentum import RSIIndicator
+from ta.trend import MACD, EMAIndicator
 from binance.client import Client
 from binance.enums import *
 from dotenv import load_dotenv
@@ -103,13 +104,13 @@ class TradingBot:
                 df['low'] = pd.to_numeric(df['low'])
                 df['volume'] = pd.to_numeric(df['volume'])
                 
-                # Calcular indicadores con pandas-ta
-                df['rsi'] = ta.rsi(df['close'], length=14)
-                macd = ta.macd(df['close'], fast=12, slow=26, signal=9)
-                df['macd'] = macd['MACD_12_26_9']
-                df['macd_signal'] = macd['MACDs_12_26_9']
-                df['ema_20'] = ta.ema(df['close'], length=20)
-                df['ema_50'] = ta.ema(df['close'], length=50)
+                # Calcular indicadores con ta
+                df['rsi'] = RSIIndicator(df['close'], window=14).rsi()
+                macd_indicator = MACD(df['close'], window_fast=12, window_slow=26, window_sign=9)
+                df['macd'] = macd_indicator.macd()
+                df['macd_signal'] = macd_indicator.macd_signal()
+                df['ema_20'] = EMAIndicator(df['close'], window=20).ema_indicator()
+                df['ema_50'] = EMAIndicator(df['close'], window=50).ema_indicator()
                 
                 # Precio actual
                 ticker = self.client.futures_symbol_ticker(symbol=pair)

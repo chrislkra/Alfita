@@ -7,6 +7,7 @@ import os
 import json
 import time
 import logging
+import threading
 from datetime import datetime
 from typing import Optional, Dict, List
 import requests
@@ -18,6 +19,9 @@ from binance.enums import *
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Modelo gratis para chat de Telegram
+FREE_CHAT_MODEL = "meta-llama/llama-3.2-3b-instruct:free"
 
 # ============== CONFIGURACIÓN ==============
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
@@ -52,16 +56,17 @@ class TradingBot:
     def __init__(self):
         # Binance Testnet
         self.client = Client(
-            BINANCE_API_KEY, 
+            BINANCE_API_KEY,
             BINANCE_SECRET_KEY,
             testnet=True
         )
         self.client.FUTURES_URL = 'https://testnet.binancefuture.com/fapi'
-        
+
         self.positions: Dict[str, dict] = {}
-        self.trade_history: List[dict] = []
+        self.trade_history: List[dict] = []  # Historial con razones
         self.daily_pnl = 0.0
         self.is_paused = False
+        self.last_update_id = 0  # Para polling de Telegram
 
         logger.info("🤖 Trading Bot iniciado - Modo Alpha Arena")
         self._setup_leverage()
@@ -73,6 +78,12 @@ class TradingBot:
         account = self.client.futures_account()
         self.starting_balance = float(account['totalWalletBalance'])
         logger.info(f"💰 Balance inicial: ${self.starting_balance:.2f}")
+
+        # Iniciar listener de Telegram en hilo separado
+        if TELEGRAM_BOT_TOKEN:
+            self.telegram_thread = threading.Thread(target=self._telegram_listener, daemon=True)
+            self.telegram_thread.start()
+            logger.info("📱 Telegram listener iniciado")
 
     def _close_all_positions(self):
         """Cierra todas las posiciones abiertas al iniciar"""
@@ -325,44 +336,59 @@ ACCOUNT STATUS:
             logger.error(f"❌ Error consultando DeepSeek: {e}")
             return None
     
+    def _save_trade(self, action: str, symbol: str, reasoning: str, price: float = 0, quantity: float = 0):
+        """Guarda trade en historial"""
+        self.trade_history.append({
+            'action': action,
+            'symbol': symbol,
+            'reasoning': reasoning,
+            'price': price,
+            'quantity': quantity,
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M")
+        })
+        # Mantener solo últimos 50 trades
+        if len(self.trade_history) > 50:
+            self.trade_history = self.trade_history[-50:]
+
     def execute_trade(self, decision: dict) -> bool:
         """Ejecuta la orden basada en la decisión de DeepSeek"""
         try:
             action = decision.get('action', 'HOLD')
             symbol = decision.get('symbol', '')
-            
+            reasoning = decision.get('reasoning', 'No reason provided')
+
             if action == 'HOLD':
-                logger.info(f"⏸️ HOLD - {decision.get('reasoning', 'No action needed')}")
+                logger.info(f"⏸️ HOLD - {reasoning}")
                 return True
-            
+
             if action in ['OPEN_LONG', 'OPEN_SHORT']:
                 # Calcular tamaño de posición
                 account = self.get_account_info()
                 size_percent = decision.get('size_percent', 10) / 100
                 leverage = decision.get('leverage', DEFAULT_LEVERAGE)
-                
+
                 # Respetar cash buffer
                 max_usable = account['available'] * (1 - CASH_BUFFER_PERCENT)
                 position_value = max_usable * size_percent
-                
+
                 # Obtener precio actual y calcular cantidad
                 ticker = self.client.futures_symbol_ticker(symbol=symbol)
                 current_price = float(ticker['price'])
                 quantity = (position_value * leverage) / current_price
-                
+
                 # Redondear cantidad según el par
                 quantity = self._round_quantity(symbol, quantity)
-                
+
                 if quantity <= 0:
                     logger.warning(f"⚠️ Cantidad calculada es 0 para {symbol}")
                     return False
-                
+
                 # Determinar lado
                 side = SIDE_BUY if action == 'OPEN_LONG' else SIDE_SELL
-                
+
                 # Configurar leverage
                 self.client.futures_change_leverage(symbol=symbol, leverage=leverage)
-                
+
                 # Orden de mercado
                 order = self.client.futures_create_order(
                     symbol=symbol,
@@ -370,21 +396,30 @@ ACCOUNT STATUS:
                     type=ORDER_TYPE_MARKET,
                     quantity=quantity
                 )
-                
+
                 logger.info(f"✅ {action} ejecutado: {symbol} x{leverage} - Cantidad: {quantity}")
-                
+
+                # Guardar en historial
+                self._save_trade(action, symbol, reasoning, current_price, quantity)
+
                 # Configurar TP/SL
                 tp_price = decision.get('take_profit')
                 sl_price = decision.get('stop_loss')
-                
+
                 if tp_price and sl_price:
                     self._set_tp_sl(symbol, action, quantity, tp_price, sl_price)
-                
+
                 # Notificar
-                self._notify(f"🟢 {action}\n{symbol} @ ${current_price:,.2f}\nSize: {quantity}\nLeverage: {leverage}x\nTP: ${tp_price:,.2f}\nSL: ${sl_price:,.2f}")
-                
+                msg = f"🟢 *{action}*\n"
+                msg += f"📍 {symbol} @ ${current_price:,.2f}\n"
+                msg += f"📊 Size: {quantity} | Leverage: {leverage}x\n"
+                if tp_price and sl_price:
+                    msg += f"🎯 TP: ${tp_price:,.2f} | SL: ${sl_price:,.2f}\n"
+                msg += f"\n💬 _{reasoning}_"
+                self._notify(msg)
+
                 return True
-            
+
             elif action == 'CLOSE':
                 # Cerrar posición existente
                 positions = self.client.futures_position_information(symbol=symbol)
@@ -393,7 +428,8 @@ ACCOUNT STATUS:
                     if pos_amt != 0:
                         side = SIDE_SELL if pos_amt > 0 else SIDE_BUY
                         quantity = abs(pos_amt)
-                        
+                        entry_price = float(pos['entryPrice'])
+
                         order = self.client.futures_create_order(
                             symbol=symbol,
                             side=side,
@@ -401,14 +437,22 @@ ACCOUNT STATUS:
                             quantity=quantity,
                             reduceOnly=True
                         )
-                        
+
                         logger.info(f"✅ Posición cerrada: {symbol}")
-                        self._notify(f"🔴 CLOSE {symbol}\nReason: {decision.get('reasoning', 'N/A')}")
+
+                        # Guardar en historial
+                        self._save_trade(action, symbol, reasoning, entry_price, quantity)
+
+                        # Notificar
+                        msg = f"🔴 *CLOSE*\n"
+                        msg += f"📍 {symbol}\n"
+                        msg += f"\n💬 _{reasoning}_"
+                        self._notify(msg)
                         return True
-                
+
                 logger.warning(f"⚠️ No hay posición abierta en {symbol}")
                 return False
-            
+
             return True
             
         except Exception as e:
@@ -479,15 +523,180 @@ ACCOUNT STATUS:
         precision = precisions.get(symbol, 2)
         return round(price, precision)
     
+    def _telegram_listener(self):
+        """Escucha mensajes de Telegram en loop"""
+        logger.info("📱 Iniciando Telegram polling...")
+        while True:
+            try:
+                url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+                response = requests.get(url, params={
+                    "offset": self.last_update_id + 1,
+                    "timeout": 30
+                }, timeout=35)
+
+                if response.status_code == 200:
+                    updates = response.json().get("result", [])
+                    for update in updates:
+                        self.last_update_id = update["update_id"]
+                        if "message" in update:
+                            self._handle_telegram_message(update["message"])
+            except Exception as e:
+                logger.warning(f"⚠️ Error en Telegram polling: {e}")
+                time.sleep(5)
+
+    def _handle_telegram_message(self, message: dict):
+        """Procesa mensajes de Telegram"""
+        chat_id = message["chat"]["id"]
+        text = message.get("text", "").strip()
+
+        if not text:
+            return
+
+        # Comandos con /
+        if text.startswith("/"):
+            cmd = text.split()[0].lower()
+            if cmd == "/start":
+                self._send_telegram(chat_id, "🤖 *Alpha Arena Bot*\n\nComandos:\n/status - Ver posiciones y balance\n/history - Ver historial de trades\n/market - Ver datos de mercado\n\nO escribe cualquier pregunta sobre el mercado.")
+            elif cmd == "/status":
+                self._cmd_status(chat_id)
+            elif cmd == "/history":
+                self._cmd_history(chat_id)
+            elif cmd == "/market":
+                self._cmd_market(chat_id)
+            else:
+                self._send_telegram(chat_id, "Comando no reconocido. Usa /start para ver comandos.")
+        else:
+            # Chat natural con modelo gratis
+            self._cmd_chat(chat_id, text)
+
+    def _cmd_status(self, chat_id: int):
+        """Comando /status - muestra posiciones y balance"""
+        try:
+            account = self.get_account_info()
+            if not account:
+                self._send_telegram(chat_id, "❌ Error obteniendo datos de cuenta")
+                return
+
+            msg = f"📊 *Estado de la Cuenta*\n\n"
+            msg += f"💰 Balance: ${account['balance']:,.2f}\n"
+            msg += f"📈 PnL No Realizado: ${account['unrealized_pnl']:,.2f}\n"
+            msg += f"💵 Equity: ${account['equity']:,.2f}\n"
+            msg += f"🏦 Disponible: ${account['available']:,.2f}\n"
+            msg += f"📍 Posiciones: {account['position_count']}/6\n\n"
+
+            if account['open_positions']:
+                msg += "*Posiciones Abiertas:*\n"
+                for pos in account['open_positions']:
+                    emoji = "🟢" if pos['unrealized_pnl'] >= 0 else "🔴"
+                    msg += f"{emoji} {pos['symbol']} {pos['side']}\n"
+                    msg += f"   Size: {pos['size']} @ ${pos['entry_price']:,.2f}\n"
+                    msg += f"   PnL: ${pos['unrealized_pnl']:,.2f}\n"
+            else:
+                msg += "_Sin posiciones abiertas_"
+
+            self._send_telegram(chat_id, msg)
+        except Exception as e:
+            self._send_telegram(chat_id, f"❌ Error: {e}")
+
+    def _cmd_history(self, chat_id: int):
+        """Comando /history - muestra historial de trades"""
+        if not self.trade_history:
+            self._send_telegram(chat_id, "📜 *Historial de Trades*\n\n_No hay trades registrados aún_")
+            return
+
+        msg = "📜 *Historial de Trades*\n\n"
+        for i, trade in enumerate(self.trade_history[-10:], 1):  # Últimos 10
+            emoji = "🟢" if trade['action'] in ['OPEN_LONG', 'OPEN_SHORT'] else "🔴"
+            msg += f"{emoji} *{trade['action']}* {trade['symbol']}\n"
+            msg += f"   📅 {trade['timestamp']}\n"
+            msg += f"   💬 _{trade['reasoning']}_\n\n"
+
+        self._send_telegram(chat_id, msg)
+
+    def _cmd_market(self, chat_id: int):
+        """Comando /market - muestra datos de mercado"""
+        try:
+            market_data = self.get_market_data()
+            msg = "📈 *Datos de Mercado*\n\n"
+
+            for pair, data in market_data.items():
+                if data:
+                    trend_emoji = "🟢" if data['trend'] == 'BULLISH' else "🔴"
+                    msg += f"*{pair}* {trend_emoji}\n"
+                    msg += f"  💵 ${data['price']:,.2f}\n"
+                    msg += f"  RSI: {data['rsi']} | {data['trend']}\n\n"
+
+            self._send_telegram(chat_id, msg)
+        except Exception as e:
+            self._send_telegram(chat_id, f"❌ Error: {e}")
+
+    def _cmd_chat(self, chat_id: int, question: str):
+        """Chat natural con modelo gratis"""
+        try:
+            # Obtener contexto actual
+            account = self.get_account_info()
+            market_data = self.get_market_data()
+
+            context = f"""Eres un asistente de trading crypto. Responde en español, breve y útil.
+
+Datos actuales:
+- Balance: ${account['balance']:,.2f}
+- PnL: ${account['unrealized_pnl']:,.2f}
+- Posiciones abiertas: {account['position_count']}/6
+
+Mercado:
+"""
+            for pair, data in market_data.items():
+                if data:
+                    context += f"- {pair}: ${data['price']:,.2f}, RSI={data['rsi']}, {data['trend']}\n"
+
+            context += f"\nPregunta del usuario: {question}"
+
+            # Llamar modelo gratis
+            response = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": FREE_CHAT_MODEL,
+                    "messages": [{"role": "user", "content": context}],
+                    "max_tokens": 500
+                },
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                answer = response.json()['choices'][0]['message']['content']
+                self._send_telegram(chat_id, f"🤖 {answer}")
+            else:
+                self._send_telegram(chat_id, "❌ Error consultando IA")
+
+        except Exception as e:
+            self._send_telegram(chat_id, f"❌ Error: {e}")
+
+    def _send_telegram(self, chat_id: int, message: str):
+        """Envía mensaje a un chat específico"""
+        try:
+            url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+            requests.post(url, json={
+                "chat_id": chat_id,
+                "text": message,
+                "parse_mode": "Markdown"
+            })
+        except Exception as e:
+            logger.warning(f"⚠️ Error enviando Telegram: {e}")
+
     def _notify(self, message: str):
-        """Envía notificación a Telegram"""
+        """Envía notificación a Telegram (broadcast)"""
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             try:
                 url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                 requests.post(url, json={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "text": f"🤖 Alpha Arena Bot\n\n{message}",
-                    "parse_mode": "HTML"
+                    "parse_mode": "Markdown"
                 })
             except Exception as e:
                 logger.warning(f"⚠️ Error enviando Telegram: {e}")

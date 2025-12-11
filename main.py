@@ -61,11 +61,15 @@ class TradingBot:
         self.positions: Dict[str, dict] = {}
         self.trade_history: List[dict] = []
         self.daily_pnl = 0.0
-        self.starting_balance = INITIAL_BALANCE
         self.is_paused = False
-        
+
         logger.info("🤖 Trading Bot iniciado - Modo Alpha Arena")
         self._setup_leverage()
+
+        # Usar balance actual como punto de partida
+        account = self.client.futures_account()
+        self.starting_balance = float(account['totalWalletBalance'])
+        logger.info(f"💰 Balance inicial: ${self.starting_balance:.2f}")
     
     def _setup_leverage(self):
         """Configura leverage para todos los pares"""

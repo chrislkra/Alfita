@@ -172,7 +172,11 @@ class TradingBot:
                     'volume_24h': round(df['volume'].sum(), 2),
                     'trend': 'BULLISH' if df['ema_20'].iloc[-1] > df['ema_50'].iloc[-1] else 'BEARISH'
                 }
-                
+
+                # Logging de diagnóstico
+                logger.info(f"📊 MARKET DATA: {pair}: price=${current_price:,.2f}, vol=${market_data[pair]['volume_24h']:,.2f}")
+                logger.info(f"📈 INDICATORS: {pair}: RSI={market_data[pair]['rsi']}, MACD={market_data[pair]['macd']}, Signal={market_data[pair]['macd_signal']}, EMA20=${market_data[pair]['ema_20']:,.2f}, EMA50=${market_data[pair]['ema_50']:,.2f}")
+
             except Exception as e:
                 logger.error(f"❌ Error obteniendo datos de {pair}: {e}")
                 market_data[pair] = None
@@ -260,6 +264,20 @@ ACCOUNT STATUS:
     def query_deepseek(self, prompt: str) -> Optional[dict]:
         """Consulta DeepSeek via OpenRouter"""
         try:
+            # Logging del payload completo
+            payload = {
+                "model": "deepseek/deepseek-chat",  # DeepSeek V3
+                "messages": [
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.3,  # Bajo para decisiones más consistentes
+                "max_tokens": 1000
+            }
+            logger.info(f"🧠 DEEPSEEK PAYLOAD: {json.dumps(payload, indent=2)}")
+
+            # Medir tiempo de respuesta
+            start_time = time.time()
+
             response = requests.post(
                 "https://openrouter.ai/api/v1/chat/completions",
                 headers={
@@ -268,17 +286,13 @@ ACCOUNT STATUS:
                     "HTTP-Referer": "https://github.com/trading-bot",
                     "X-Title": "Alpha Arena Trading Bot"
                 },
-                json={
-                    "model": "deepseek/deepseek-chat",  # DeepSeek V3
-                    "messages": [
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.3,  # Bajo para decisiones más consistentes
-                    "max_tokens": 1000
-                },
+                json=payload,
                 timeout=60
             )
-            
+
+            elapsed_time = time.time() - start_time
+            logger.info(f"⏱️ DeepSeek response time: {elapsed_time:.2f}s")
+
             if response.status_code == 200:
                 result = response.json()
                 content = result['choices'][0]['message']['content']
